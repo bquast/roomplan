@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XRayRoom — Quest 3 x-ray</title>
+<style>
+html, body { margin: 0; height: 100%; background: #05090e; color: #dfe; font: 15px/1.45 system-ui, sans-serif; overflow: hidden; }
+canvas { display: block; }
+#ui { position: absolute; top: 16px; left: 16px; max-width: 420px; background: rgba(5, 12, 20, 0.85); padding: 16px 18px; border-radius: 12px; }
+h1 { margin: 0 0 4px; font-size: 22px; color: #4de6ff; }
+button, label.btn { display: inline-block; margin: 8px 8px 0 0; padding: 10px 16px; border: 0; border-radius: 8px; background: #1a5a70; color: #fff; font: 600 15px system-ui; cursor: pointer; }
+button:disabled { opacity: 0.4; }
+#file { display: none; }
+select { margin: 8px 8px 0 0; padding: 10px; border-radius: 8px; background: #0d2a36; color: #fff; border: 0; font: 15px system-ui; }
+#msg { margin-top: 10px; color: #9cb; font-size: 13px; }
+small { color: #789; }
+</style>
+</head>
+<body>
+<div id="ui">
+	<h1>XRayRoom</h1>
+	<div>LiDAR CAD model with x-ray services, on Quest 3 passthrough.</div>
+	<button id="ar" disabled>Enter AR</button>
+	<select id="scan">
+		<option value="airbnb.json">Airbnb scan (2026-11-22)</option>
+		<option value="demo.json">Demo room</option>
+	</select>
+	<label class="btn" for="file">Load model.json</label>
+	<input id="file" type="file" accept=".json,application/json">
+	<div id="msg">Loading…</div>
+	<small>In AR: trigger = shoot / pick floor point · A/X = align again · B/Y = layers ·
+	left stick = move · right stick = rotate / height · grip = hide info.
+	Record with the Quest camera menu (Meta button → Camera → Record video).</small>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
