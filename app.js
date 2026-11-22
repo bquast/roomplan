@@ -109,7 +109,7 @@ const world = new THREE.Group();     // alignment: model -> real room
 scene.add(world);
 
 let els = [], picks = [], nodes = [], edgeMeshes = [], model = null;
-let floorY = 0, center = new THREE.Vector3(), ref = null, size = 5, layer = 0;
+let floorY = 0, center = new THREE.Vector3(), refs = [], refIdx = 0, cadSegs = [], size = 5, layer = 0;
 const al = { x: 0, y: 0, z: 0, yaw: 0 };
 
 function applyAlign() {
@@ -165,29 +165,75 @@ function buildModel(list) {
 		edgeMeshes.push(edge);
 	});
 
-	// floor, centre and the longest wall as the alignment reference
+	// floor, centre, and straight wall lines as alignment references
 	const walls = list.filter(e => e.kind === 'wall');
 	floorY = Infinity;
 	center.set(0, 0, 0);
-	ref = null;
-	let best = 0;
 	for (const w of walls) {
-		const T = new THREE.Matrix4().fromArray(w.t), p = new THREE.Vector3().setFromMatrixPosition(T);
+		const p = new THREE.Vector3().setFromMatrixPosition(new THREE.Matrix4().fromArray(w.t));
 		floorY = Math.min(floorY, p.y - w.h / 2);
 		center.add(p);
-		if (w.w > best) {
-			best = w.w;
-			ref = [new THREE.Vector3(-w.w / 2, -w.h / 2, 0).applyMatrix4(T), new THREE.Vector3(w.w / 2, -w.h / 2, 0).applyMatrix4(T)];
-		}
 	}
 	if (walls.length)
 		center.divideScalar(walls.length);
 	if (!isFinite(floorY))
 		floorY = 0;
 	center.y = floorY;
+	refs = wallLines(walls);
+	refIdx = 0;
+	cadSegs = walls.map(w => {
+		const T = new THREE.Matrix4().fromArray(w.t);
+		const a = new THREE.Vector3(-w.w / 2, 0, 0).applyMatrix4(T), b = new THREE.Vector3(w.w / 2, 0, 0).applyMatrix4(T);
+		return [a.x, a.z, b.x, b.z];
+	});
 	const bb = new THREE.Box3().setFromObject(g);
 	size = Math.max(1, bb.max.x - bb.min.x, bb.max.z - bb.min.z);
 	return g;
+}
+
+// RoomPlan splits one physical wall into parts (at stairs, corners of niches).
+// Merge collinear parts (5 deg, 15 cm, gaps < 1.2 m) into straight lines, longest first.
+function wallLines(walls) {
+	const runs = [], ends = [];
+	walls.forEach((w, i) => {
+		const T = new THREE.Matrix4().fromArray(w.t);
+		for (const x of [-w.w / 2, w.w / 2]) {
+			const e = new THREE.Vector3(x, 0, 0).applyMatrix4(T);
+			ends.push({ i, x: e.x, z: e.z });
+		}
+	});
+	walls.forEach((w, wi) => {
+		const T = new THREE.Matrix4().fromArray(w.t);
+		const a = new THREE.Vector3(-w.w / 2, 0, 0).applyMatrix4(T), b = new THREE.Vector3(w.w / 2, 0, 0).applyMatrix4(T);
+		const d = new THREE.Vector2(b.x - a.x, b.z - a.z).normalize();
+		if (d.x < -1e-6 || (Math.abs(d.x) < 1e-6 && d.y < 0))
+			d.negate();
+		const n = new THREE.Vector2(-d.y, d.x);
+		const off = n.x * a.x + n.y * a.z;
+		const t0 = d.x * a.x + d.y * a.z, t1 = d.x * b.x + d.y * b.z;
+		let g = runs.find(g => g.d.dot(d) > 0.996 && Math.abs(g.off - off) < 0.15);
+		if (!g)
+			runs.push(g = { d, n, off, iv: [], m: new Set() });
+		g.iv.push([Math.min(t0, t1), Math.max(t0, t1)]);
+		g.m.add(wi);
+	});
+	// a wall of another line ending at the joint = T-junction or niche: do not merge there
+	const blocked = (g, t0, t1) => ends.some(e => !g.m.has(e.i) &&
+		Math.abs(g.n.x * e.x + g.n.y * e.z - g.off) < 0.2 &&
+		(g.d.x * e.x + g.d.y * e.z) > t0 - 0.2 && (g.d.x * e.x + g.d.y * e.z) < t1 + 0.2);
+	const lines = [];
+	for (const g of runs) {
+		g.iv.sort((p, q) => p[0] - q[0]);
+		const P = t => new THREE.Vector3(g.n.x * g.off + g.d.x * t, floorY, g.n.y * g.off + g.d.y * t);
+		let cur = g.iv[0].slice();
+		const flush = () => lines.push({ a: P(cur[0]), b: P(cur[1]), len: cur[1] - cur[0] });
+		for (const iv of g.iv.slice(1)) {
+			if (iv[0] <= cur[1] + 1.2 && !blocked(g, cur[1], iv[0])) cur[1] = Math.max(cur[1], iv[1]);
+			else { flush(); cur = iv.slice(); }
+		}
+		flush();
+	}
+	return lines.filter(l => l.len >= 1).sort((p, q) => q.len - p.len);
 }
 
 function setModel(list, name) {
@@ -379,7 +425,7 @@ function shoot(o, d, eye, src) {
 
 // ---- XR: controllers, alignment ----
 
-let state = 'desktop', needMini = false, mini = null, clicks = [], order = null;
+let state = 'desktop', needMini = false, mini = null, clicks = [], order = null, curFrame = null, liveT = 0;
 const marks = [];
 const reticle = new THREE.Mesh(new THREE.SphereGeometry(0.01, 12, 8),
 	new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false, transparent: true }));
@@ -395,8 +441,17 @@ const ctrls = [0, 1].map(i => {
 	c.add(line);
 	c.userData.line = line;
 	c.userData.prev = [];
-	c.addEventListener('connected', e => { c.userData.src = e.data; });
-	c.addEventListener('disconnected', () => { c.userData.src = null; });
+	c.addEventListener('connected', e => {
+		c.userData.src = e.data;
+		const s = renderer.xr.getSession();     // hit-test against the Quest room mesh, if granted
+		if (s?.requestHitTestSource && e.data.targetRaySpace)
+			s.requestHitTestSource({ space: e.data.targetRaySpace }).then(h => { c.userData.hts = h; }).catch(() => {});
+	});
+	c.addEventListener('disconnected', () => {
+		c.userData.src = null;
+		c.userData.hts?.cancel?.();
+		c.userData.hts = null;
+	});
 	c.addEventListener('selectstart', () => trigger(c));
 	c.addEventListener('squeezestart', () => { panel.visible = false; });
 	scene.add(c);
@@ -413,6 +468,21 @@ function ctrlRay(c) {
 function floorHit(o, d) {
 	if (d.y > -0.05) return null;
 	return o.clone().addScaledVector(d, -o.y / d.y);
+}
+
+// alignment aim: real surface (walls, corners) via hit-test, else the local-floor plane
+function aim(c, o, d) {
+	const hts = c.userData.hts;
+	if (hts && curFrame) {
+		const res = curFrame.getHitTestResults(hts);
+		const pose = res.length ? res[0].getPose(renderer.xr.getReferenceSpace()) : null;
+		if (pose) {
+			const p = pose.transform.position;
+			return { p: new THREE.Vector3(p.x, p.y, p.z), mesh: true };
+		}
+	}
+	const f = floorHit(o, d);
+	return f ? { p: f, mesh: false } : null;
 }
 
 function eyePose() {
@@ -437,14 +507,14 @@ function startAlign() {
 function showMini() {
 	if (mini) scene.remove(mini);
 	const [p, f] = eyePose();
-	if (!ref) {           // no walls: just put the model where the user stands
+	if (!refs.length) {   // no walls: just put the model where the user stands
 		Object.assign(al, { x: p.x - center.x, y: -floorY, z: p.z - center.z, yaw: 0 });
 		applyAlign();
 		world.visible = true;
 		state = 'xray';
 		return;
 	}
-	const s = 0.45 / size;
+	const s = 0.45 / size, ref = [refs[refIdx].a, refs[refIdx].b];
 	const wallMid = ref[0].clone().add(ref[1]).multiplyScalar(0.5);
 	const d = wallMid.clone().sub(center);
 	const yaw = ang(f) - ang(d);
@@ -465,6 +535,15 @@ function showMini() {
 	};
 	dot(order[0], 0x33ff66);
 	dot(order[1], 0xff3344);
+	// corner posts: the corner can be picked at any height
+	const post = (q, c) => {
+		const m = new THREE.Mesh(tubes([[q, q.clone().setY(q.y + 2.6)]], 0.005 / s),
+			new THREE.MeshBasicMaterial({ color: c, depthTest: false, depthWrite: false }));
+		m.renderOrder = 12;
+		inner.add(m);
+	};
+	post(order[0], 0x33ff66);
+	post(order[1], 0xff3344);
 	const edge = new THREE.Mesh(tubes([[order[0], order[1]]], 0.006 / s), HL);
 	edge.renderOrder = 12;
 	inner.add(edge);
@@ -477,33 +556,44 @@ function showMini() {
 	alignText();
 }
 
-function alignText() {
-	const step = clicks.length;
-	drawPanel('ALIGN · STEP ' + (step + 1) + ' OF 2', 'Face the yellow wall in the real room',
-		[step === 0 ? '→ Point at the floor at its LEFT corner (green dot). Pull the trigger.'
-			: '→ Now point at the floor at its RIGHT corner (red dot). Pull the trigger.',
-		 'Tip: aim where the wall meets the floor.'], step === 0 ? '#33ff66' : '#ff3344');
+function alignText(live) {
+	const step = clicks.length, ref = refs[refIdx];
+	const lines = [step === 0 ? '→ Aim at its LEFT end (green post), the corner with the next wall. Any height. Trigger.'
+			: '→ Now aim at its RIGHT end (red post). Trigger.',
+		`Wall line ${refIdx + 1} of ${refs.length}: ${ref.len.toFixed(2)} m · right stick ←/→: other wall`];
+	if (live)
+		lines.push(live);
+	drawPanel('ALIGN · STEP ' + (step + 1) + ' OF 2', 'Face the yellow wall in the real room', lines,
+		step === 0 ? '#33ff66' : '#ff3344');
+	if (live)
+		return;
 	const [p] = eyePose();
 	placePanel(mini.position.clone().add(new THREE.Vector3(0, 0.22, 0)), p, 0.9);
 	panel.scale.setScalar(1);
 }
 
 function solveAlign(a, b) {
+	// rigid fit in the floor plane: direction from the two points, midpoint on midpoint
 	const A = order[0], B = order[1];
 	const yaw = ang(b.clone().sub(a)) - ang(B.clone().sub(A));
-	const RA = rotY(A, yaw);
-	Object.assign(al, { x: a.x - RA.x, y: -floorY, z: a.z - RA.z, yaw });
+	const mA = rotY(A.clone().add(B).multiplyScalar(0.5), yaw), ma = a.clone().add(b).multiplyScalar(0.5);
+	Object.assign(al, { x: ma.x - mA.x, y: -floorY, z: ma.z - mA.z, yaw });
 	applyAlign();
-	const real = a.distanceTo(b), cad = Math.hypot(B.x - A.x, B.z - A.z);
+	const real = Math.hypot(b.x - a.x, b.z - a.z), cad = Math.hypot(B.x - A.x, B.z - A.z);
+	const bad = Math.abs(real - cad) > 0.08 * cad;
 	if (mini) { scene.remove(mini); mini = null; }
 	world.visible = true;
 	state = 'xray';
 	const [p] = eyePose();
 	drawPanel('ALIGNED', 'X-ray on. Aim and pull the trigger.',
 		[`Wall: CAD ${cad.toFixed(2)} m · your points ${real.toFixed(2)} m`,
-		 'Left stick: move · Right stick: rotate / height', 'A/X: align again · B/Y: layers · Grip: hide'], '#40e6ff');
+		 bad ? '⚠ Lengths differ: wrong corner? Press A/X to align again.' : 'Lengths match.',
+		 'Left stick: move · Right stick: rotate / height', 'A/X: align again · B/Y: layers · Grip: hide'],
+		bad ? '#ffb31a' : '#40e6ff');
 	placePanel(p.clone().add(new THREE.Vector3(0, -0.1, 0)).addScaledVector(eyePose()[1], 1.0), p, 1);
 	panel.scale.setScalar(1);
+	if (!bad)
+		setTimeout(() => { if (state === 'xray') startFit(); }, 2500);
 }
 
 function trigger(c) {
@@ -511,18 +601,18 @@ function trigger(c) {
 	const [o, d] = ctrlRay(c);
 	const src = c.userData.src;
 	if (state === 'align1' || state === 'align2') {
-		const h = floorHit(o, d);
+		const h = c.userData.aim?.p;
 		if (!h || !mini) return;
 		src?.gamepad?.hapticActuators?.[0]?.pulse?.(0.4, 30);
 		pew();
 		const m = new THREE.Mesh(new THREE.RingGeometry(0.04, 0.06, 24),
 			new THREE.MeshBasicMaterial({ color: clicks.length ? 0xff3344 : 0x33ff66, side: THREE.DoubleSide, depthTest: false }));
 		m.rotation.x = -Math.PI / 2;
-		m.position.copy(h).setY(0.002);
+		m.position.set(h.x, 0.002, h.z);
 		m.renderOrder = 12;
 		scene.add(m);
 		marks.push(m);
-		clicks.push(h);
+		clicks.push(h.clone());
 		if (clicks.length === 1) { state = 'align2'; alignText(); }
 		else solveAlign(clicks[0], clicks[1]);
 	} else if (state === 'xray') {
@@ -532,6 +622,7 @@ function trigger(c) {
 
 function xrUpdate(dt) {
 	if (needMini) { needMini = false; showMini(); }
+	if (fit) fitUpdate(dt);
 	const [eye, f] = eyePose();
 	const r = new THREE.Vector3(-f.z, 0, f.x);
 	reticle.visible = false;
@@ -545,8 +636,17 @@ function xrUpdate(dt) {
 			const h = pick(o, d);
 			if (h) { len = h.distance; at = h.point; }
 		} else if (state.startsWith('align')) {
-			at = floorHit(o, d);
-			if (at) len = o.distanceTo(at);
+			const h = c.userData.aim = aim(c, o, d);
+			if (h) {
+				at = h.p;
+				len = o.distanceTo(at);
+				reticle.material.color.set(h.mesh ? 0x40e6ff : 0xffffff);
+			}
+			if (h && state === 'align2' && (liveT += dt) > 0.2) {
+				liveT = 0;
+				const a = clicks[0];
+				alignText(`Span now: ${Math.hypot(h.p.x - a.x, h.p.z - a.z).toFixed(2)} m (CAD ${refs[refIdx].len.toFixed(2)} m)`);
+			}
 		}
 		c.userData.line.scale.z = len;
 		if (at) {
@@ -557,7 +657,8 @@ function xrUpdate(dt) {
 		const gp = src.gamepad;
 		if (!gp) continue;
 		const prev = c.userData.prev, btn = k => gp.buttons[k]?.pressed && !prev[k];
-		if (btn(4)) startAlign();
+		if (btn(4)) { endFit(true); startAlign(); }
+		if (btn(3) && state === 'xray') startFit();
 		if (btn(5) && state === 'xray') {
 			layer = (layer + 1) % 3;
 			applyLayer();
@@ -566,9 +667,18 @@ function xrUpdate(dt) {
 			panel.scale.setScalar(1);
 		}
 		c.userData.prev = gp.buttons.map(b => b.pressed);
-		if (state !== 'xray') continue;
 		const ax = gp.axes.length >= 4 ? gp.axes[2] : gp.axes[0] || 0;
 		const ay = gp.axes.length >= 4 ? gp.axes[3] : gp.axes[1] || 0;
+		if (state.startsWith('align') && src.handedness === 'right' && refs.length > 1) {
+			if (Math.abs(ax) > 0.7 && !c.userData.flick) {
+				c.userData.flick = true;
+				refIdx = (refIdx + (ax > 0 ? 1 : refs.length - 1)) % refs.length;
+				startAlign();
+			}
+			if (Math.abs(ax) < 0.3)
+				c.userData.flick = false;
+		}
+		if (state !== 'xray') continue;
 		const dz = v => Math.abs(v) < 0.15 ? 0 : v;
 		if (src.handedness === 'left') {
 			const m = r.clone().multiplyScalar(dz(ax)).addScaledVector(f, -dz(ay)).multiplyScalar(0.4 * dt);
@@ -589,6 +699,140 @@ function xrUpdate(dt) {
 	}
 }
 
+// ---- auto-fit: refine yaw and position with Quest hit-test points on the real walls ----
+// Gaze hit-test (viewer space) collects points at chest-to-head height; 2D point-to-line ICP
+// against the CAD walls, damped, small steps. Starts after the two-point alignment.
+
+let fit = null;
+const FITMAX = 600;
+const dots = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(FITMAX * 3), 3)),
+	new THREE.PointsMaterial({ color: 0x4dff80, size: 0.025, depthTest: false, transparent: true }));
+dots.renderOrder = 12;
+dots.frustumCulled = false;
+dots.visible = false;
+scene.add(dots);
+
+function startFit() {
+	const s = renderer.xr.getSession();
+	endFit(true);
+	if (!s?.requestHitTestSource || !cadSegs.length) {
+		drawPanel('AUTO-FIT', 'Not available', ['Needs WebXR hit-test (Quest Space Setup) and walls in the scan.']);
+		return;
+	}
+	fit = { pts: [], t: 0, age: 0, rms: 0, inl: 0, move: 1, src: null, txt: 0 };
+	const f = fit;
+	s.requestReferenceSpace('viewer').then(vs => s.requestHitTestSource({ space: vs }))
+		.then(h => { if (fit === f) f.src = h; else h.cancel(); }).catch(() => { if (fit === f) fit = null; });
+	dots.visible = true;
+	dots.geometry.setDrawRange(0, 0);
+	const [eye, fw] = eyePose();
+	fitText();
+	placePanel(eye.clone().addScaledVector(fw, 1.1).add(new THREE.Vector3(0, -0.3, 0)), eye, 1.1);
+	panel.scale.setScalar(1);
+}
+
+function endFit(quiet) {
+	if (!fit) return;
+	fit.src?.cancel?.();
+	const f = fit;
+	fit = null;
+	setTimeout(() => { if (!fit) dots.visible = false; }, 3000);
+	if (!quiet)
+		drawPanel('AUTO-FIT DONE', f.inl ? `Wall error ${(f.rms * 100).toFixed(1)} cm` : 'No wall points found',
+			[`${f.inl} of ${f.pts.length} points on CAD walls`, 'Thumbstick press: run again · A/X: align again']);
+}
+
+function fitText() {
+	drawPanel('AUTO-FIT · ' + Math.max(0, 30 - (fit?.age || 0)).toFixed(0) + ' s', 'Look around at the walls',
+		['Slowly, at chest to head height. Green dots = Quest hits.',
+		 `Points: ${fit?.pts.length || 0} · on CAD walls: ${fit?.inl || 0}`,
+		 fit?.inl ? `Wall error (RMS): ${(fit.rms * 100).toFixed(1)} cm` : 'Waiting for points…'], '#4dff80');
+}
+
+function icpStep() {
+	world.updateMatrixWorld(true);
+	const W = world.matrixWorld;
+	const segs = cadSegs.map(s => [new THREE.Vector3(s[0], 0, s[1]).applyMatrix4(W), new THREE.Vector3(s[2], 0, s[3]).applyMatrix4(W)]);
+	const c = world.localToWorld(center.clone());
+	const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], B = [0, 0, 0];
+	const thr = fit.age < 8 ? 0.5 : 0.3;
+	let n = 0, sq = 0;
+	for (const q of fit.pts) {
+		let best = null, bd = thr;
+		for (const [a, b] of segs) {
+			const dx = b.x - a.x, dz = b.z - a.z, L2 = dx * dx + dz * dz;
+			if (L2 < 1e-4) continue;
+			const t = ((q.x - a.x) * dx + (q.z - a.z) * dz) / L2;
+			if (t < -0.05 || t > 1.05) continue;
+			const tc = Math.min(1, Math.max(0, t)), px = a.x + tc * dx, pz = a.z + tc * dz;
+			const d = Math.hypot(q.x - px, q.z - pz);
+			if (d < bd) {
+				const L = Math.sqrt(L2);
+				bd = d;
+				best = { px, pz, nx: -dz / L, nz: dx / L };
+			}
+		}
+		if (!best) continue;
+		const r = (q.x - best.px) * best.nx + (q.z - best.pz) * best.nz;
+		const J = [(best.pz - c.z) * best.nx - (best.px - c.x) * best.nz, best.nx, best.nz];
+		for (let i = 0; i < 3; i++) {
+			B[i] += J[i] * r;
+			for (let j = 0; j < 3; j++) A[i][j] += J[i] * J[j];
+		}
+		n++;
+		sq += r * r;
+	}
+	fit.inl = n;
+	fit.rms = n ? Math.sqrt(sq / n) : 0;
+	if (n < 20) return;
+	for (let i = 0; i < 3; i++) A[i][i] += 0.05 * n;      // damping: keeps unseen directions still
+	const det = m => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+		+ m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+	const D = det(A);
+	if (Math.abs(D) < 1e-9) return;
+	const x = [0, 1, 2].map(k => det(A.map((row, i) => row.map((v, j) => j === k ? B[i] : v))) / D);
+	const th = Math.max(-0.05, Math.min(0.05, x[0]));
+	let tx = x[1], tz = x[2];
+	const tl = Math.hypot(tx, tz);
+	if (tl > 0.15) { tx *= 0.15 / tl; tz *= 0.15 / tl; }
+	const rp = rotY(new THREE.Vector3(al.x - c.x, 0, al.z - c.z), th);
+	al.x = c.x + rp.x + tx;
+	al.z = c.z + rp.z + tz;
+	al.yaw += th;
+	applyAlign();
+	fit.move = Math.hypot(tx, tz) + Math.abs(th) * 3;
+}
+
+function fitUpdate(dt) {
+	fit.age += dt;
+	if (fit.src && curFrame) {
+		const res = curFrame.getHitTestResults(fit.src);
+		const pose = res.length ? res[0].getPose(renderer.xr.getReferenceSpace()) : null;
+		if (pose) {
+			const p = pose.transform.position, v = new THREE.Vector3(p.x, p.y, p.z);
+			const last = fit.pts[fit.pts.length - 1];
+			if (p.y > 0.9 && p.y < 2.2 && (!last || last.distanceTo(v) > 0.05)) {
+				fit.pts.push(v);
+				if (fit.pts.length > FITMAX) fit.pts.shift();
+				const arr = dots.geometry.attributes.position.array;
+				fit.pts.forEach((q, i) => { arr[3 * i] = q.x; arr[3 * i + 1] = q.y; arr[3 * i + 2] = q.z; });
+				dots.geometry.attributes.position.needsUpdate = true;
+				dots.geometry.setDrawRange(0, fit.pts.length);
+			}
+		}
+	}
+	if ((fit.t += dt) > 0.3 && fit.pts.length >= 30) {
+		fit.t = 0;
+		icpStep();
+	}
+	if ((fit.txt += dt) > 0.5) {
+		fit.txt = 0;
+		fitText();
+	}
+	if (fit.age > 30 || (fit.age > 12 && fit.inl > 150 && fit.rms < 0.025 && fit.move < 0.003))
+		endFit(false);
+}
+
 renderer.xr.addEventListener('sessionstart', () => {
 	scene.background = null;
 	renderer.setClearColor(0x000000, 0);
@@ -600,6 +844,7 @@ renderer.xr.addEventListener('sessionend', () => {
 	$('ui').style.display = '';
 	if (mini) { scene.remove(mini); mini = null; }
 	marks.forEach(m => scene.remove(m));
+	endFit(true);
 	state = 'desktop';
 	panel.visible = false;
 	desktopAlign();
@@ -641,7 +886,8 @@ function desktopUpdate() {
 }
 
 let last = performance.now();
-renderer.setAnimationLoop(t => {
+renderer.setAnimationLoop((t, frame) => {
+	curFrame = frame || null;
 	const dt = Math.min(0.1, (t - last) / 1000);
 	last = t;
 	if (renderer.xr.isPresenting) xrUpdate(dt); else desktopUpdate();
@@ -671,7 +917,7 @@ $('file').addEventListener('change', e => {
 $('ar').addEventListener('click', async () => {
 	audio();
 	try {
-		const s = await navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['local-floor'] });
+		const s = await navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['local-floor'], optionalFeatures: ['hit-test'] });
 		await renderer.xr.setSession(s);
 	} catch (err) {
 		$('msg').textContent = 'AR failed: ' + err.message;
